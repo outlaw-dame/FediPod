@@ -441,7 +441,7 @@ check(mfm.source?.content.startsWith('$[tada') && mfm._misskey_content === mfm.s
 
   const all = mk();
   await all.pub.publishCollections();
-  check(all.seen.length === 10,
+  check(all.seen.length === 12 && all.seen.some(x => x.includes('ap/featured-tags')),
     `an unnarrowed publish is still the whole surface — the outbox is a page + a head now (saw ${all.seen.length})`);
 
   // One new follower changes the follower list. It does not change what this
@@ -875,7 +875,8 @@ check(mfm.source?.content.startsWith('$[tada') && mfm._misskey_content === mfm.s
   check(sentAccept === '*/*', 'the public probe asks for */*, not turtle');
 
   const blind = await mkPub(401).verifyPublicSurface();
-  check(blind.length === 7 && blind.includes('actor') && blind.includes('webfinger'),
+  check(blind.length === 8 && blind.includes('actor') && blind.includes('webfinger')
+    && blind.includes('featured-tags'),
     'verifyPublicSurface names every document the fediverse cannot read');
 
   const open = await mkPub(200).verifyPublicSurface();
@@ -3817,7 +3818,7 @@ const ALICE = 'https://m.example/u/alice';
 store2.write('statuses.json', [
   { noteId: OWN2, actor: urls2.actor, content: '<p>own reply</p>', published: '2026-07-28T03:00:00Z', inReplyTo: REPLY, kind: 'post', slug: 'n2' },
   { noteId: REPLY, actor: ALICE, content: '<p>a reply</p>', published: '2026-07-28T02:00:00Z', inReplyTo: OWN, kind: 'timeline' },
-  { noteId: OWN, actor: urls2.actor, content: '<p>root</p>', published: '2026-07-28T01:00:00Z', kind: 'post', slug: 'n1' },
+  { noteId: OWN, actor: urls2.actor, content: '<p>root #Fediverse</p>', published: '2026-07-28T01:00:00Z', kind: 'post', slug: 'n1' },
 ]);
 const DAN = 'https://m.example/u/dan';
 store2.setContacts({
@@ -3833,11 +3834,14 @@ store2.addNotification({ type: 'favourite', actor: ALICE, noteId: OWN });
 const delivered = [];
 const puts = [];
 const outbox2 = [];
+let tagFeedTags = ['solid'];
+let featuredTagPublishes = 0;
 const fakeAgent = {
   store: store2,
   configured: () => true,
   publisher: {
     urls: urls2, ensureMediaContainer: async () => {}, publishCollections: async () => {},
+    publishFeaturedTags: async () => { featuredTagPublishes++; },
     recordOutbox: async (i) => { outbox2.unshift(i); },
     unrecordOutbox: async (m) => {
       for (let k = outbox2.length - 1; k >= 0; k--) if (m(outbox2[k])) outbox2.splice(k, 1);
@@ -3850,6 +3854,10 @@ const fakeAgent = {
   remote: { put: async (u, b, ct) => puts.push({ u, ct, len: b.length }), putJson: async () => {}, delete: async () => true },
   local: { fedi: urls2.fediverse, delete: async () => {} },
   intake: { fetchAP: async (u) => ({ id: u, type: 'Person', inbox: u + '/inbox', preferredUsername: 'who' }) },
+  tagfeed: {
+    config: () => ({ instance: 'https://tags.example', tags: tagFeedTags, intervalMin: 60 }),
+    setConfig: ({ tags }) => { tagFeedTags = tags; },
+  },
 };
 const masto2 = new MastoApi({ agent: fakeAgent, log: () => {} });
 const bearer = masto2.mintToken();
@@ -3921,6 +3929,40 @@ const invalidFilter = await call('/api/v2/filters', {
 });
 check(invalidFilter.status === 422, 'invalid filter contexts and actions fail closed');
 await call(`/api/v2/filters/${filterCreated.json.id}`, { method: 'DELETE' });
+
+const followedBefore = await call('/api/v1/followed_tags');
+const followed = await call('/api/v1/tags/Fediverse/follow', { method: 'POST' });
+const followedAfter = await call('/api/v1/followed_tags');
+check(followedBefore.json.some(t => t.name === 'solid') && followed.json.following === true
+  && followedAfter.json.some(t => t.name === 'fediverse') && tagFeedTags.includes('fediverse'),
+  'followed-tag APIs update the polling configuration and return Mastodon Tag entities');
+const unfollowedTag = await call('/api/v1/tags/fediverse/unfollow', { method: 'POST' });
+check(unfollowedTag.json.following === false && !tagFeedTags.includes('fediverse'),
+  'unfollowing a hashtag is idempotent and stops future tag-feed polling');
+const invalidTag = await call('/api/v1/tags/1234/follow', { method: 'POST' });
+check(invalidTag.status === 404, 'numeric-only and otherwise invalid hashtags fail closed');
+
+const suggestions = await call('/api/v1/featured_tags/suggestions');
+const featuredTag = await call('/api/v1/featured_tags', {
+  method: 'POST', body: JSON.stringify({ name: '#Fediverse' }),
+});
+const featuredList = await call('/api/v1/featured_tags');
+const featuredEntity = await call('/api/v1/tags/fediverse');
+const ownFeatured = await call(`/api/v1/accounts/${store2.idFor(urls2.actor)}/featured_tags`);
+check(suggestions.json.some(t => t.name === 'fediverse')
+  && featuredTag.json.name === 'fediverse' && featuredTag.json.statuses_count === '1'
+  && featuredList.json.length === 1 && featuredEntity.json.featured === true
+  && ownFeatured.json[0].id === featuredTag.json.id && featuredTagPublishes === 1,
+  'featured-tag APIs expose suggestions, usage metadata, account tags, and publish AP state');
+const unfeatured = await call(`/api/v1/featured_tags/${featuredTag.json.id}`, { method: 'DELETE' });
+check(unfeatured.status === 200 && (await call('/api/v1/featured_tags')).json.length === 0
+  && featuredTagPublishes === 2,
+  'deleting a featured tag republishes the ActivityPub collection');
+const modernFeature = await call('/api/v1/tags/fediverse/feature', { method: 'POST' });
+const modernUnfeature = await call('/api/v1/tags/fediverse/unfeature', { method: 'POST' });
+check(modernFeature.json.featured === true && modernUnfeature.json.featured === false
+  && featuredTagPublishes === 4,
+  'Mastodon 4.4 per-tag feature and unfeature APIs update the same durable collection');
 
 const ctx = await call(`/api/v1/statuses/${store2.idFor(REPLY)}/context`);
 check(ctx.status === 200 && ctx.json.ancestors.length === 1 && ctx.json.ancestors[0].uri === OWN
@@ -4038,7 +4080,7 @@ check(del.status === 200 && delivered.some(d => d.a?.type === 'Delete' && d.a.ob
   check(anyway.status === 200 && !store2.getStatuses().some(s => s.noteId === OWN),
     'an empty replies collection that will not go is not a reason to keep the post');
   fakeAgent.remote.delete = wasDelete;
-  store2.addStatus({ noteId: OWN, actor: urls2.actor, content: '<p>root</p>',
+  store2.addStatus({ noteId: OWN, actor: urls2.actor, content: '<p>root #Fediverse</p>',
     published: '2026-07-28T01:00:00Z', kind: 'post', slug: 'n1' });
 }
 
@@ -5136,6 +5178,10 @@ const { admitRequest, refuseRequest } = await import(path.join(root, 'lib/social
   check(String(gated.featured || '').endsWith('ap/featured')
     && gated['@context'].some(c => c?.toot && c?.featured),
     'the actor names its featured collection, with the term declared');
+  check(String(gated.featuredTags || '').endsWith('ap/featured-tags')
+    && gated['@context'].some(c => c?.featuredTags)
+    && wire.featuredTagsCollection(gated.featuredTags, ['fediverse'], gated.url).items[0].type === 'Hashtag',
+    'the actor declares and publishes its distinct featured-tags collection');
 }
 {
   const g = groupIntake();
