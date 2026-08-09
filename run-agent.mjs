@@ -494,7 +494,7 @@ export class Agent {
           inReplyTo: e.params.inReplyTo, attachments: e.params.attachments,
           visibility: e.params.visibility, spoilerText: e.params.spoilerText,
           objectType: e.params.objectType, title: e.params.title,
-          contentType: e.params.contentType,
+          contentType: e.params.contentType, community: e.params.community,
         }).then(() => this.log(`scheduled post published (${e.id})`))
           .catch(err => this.log(`scheduled post ${e.id} failed: ${err.message} — dropped`));
       }

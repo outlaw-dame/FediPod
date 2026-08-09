@@ -367,10 +367,13 @@ check(mfm.source?.content.startsWith('$[tada') && mfm._misskey_content === mfm.s
     && !!publicationFields({ content_type: 'text/html' }).error
     && !!publicationFields({ status: 'x'.repeat(100_001) }).error,
   'client API rejects missing Article titles and unsupported object/content types');
+  check(publicationFields({
+    status: 'body', object_type: 'Article', title: 'Topic', community: '!Tech@LEMMY.WORLD',
+  }).community === 'Tech@lemmy.world', 'client API validates and normalizes a community target');
   const caps = instanceConfig().statuses;
   check(caps.supported_object_types.includes('Article')
-    && caps.supported_content_types.includes('text/x.misskeymarkdown'),
-  'instance capabilities advertise Article, Markdown, and Misskey MFM');
+    && caps.supported_content_types.includes('text/x.misskeymarkdown') && caps.community_targeting,
+  'instance capabilities advertise Article, Markdown, Misskey MFM, and community targeting');
 }
 
 // --- 5b. a handle only resolves from a pod at a host root ---
@@ -513,8 +516,11 @@ check(mfm.source?.content.startsWith('$[tada') && mfm._misskey_content === mfm.s
     publicKeyPem: 'x', log: () => {},
     resolveMention: async (h) => {
       asked.push(h);
-      return h === 'kofi@b.example'
-        ? { id: 'https://b.example/u/kofi', inbox: 'https://b.example/u/kofi/inbox' } : null;
+      return ({
+        'kofi@b.example': { id: 'https://b.example/u/kofi', type: 'Person', inbox: 'https://b.example/u/kofi/inbox' },
+        'tech@lemmy.example': { id: 'https://lemmy.example/c/tech', type: 'Group', inbox: 'https://lemmy.example/c/tech/inbox' },
+        'person@b.example': { id: 'https://b.example/u/person', type: 'Person', inbox: 'https://b.example/u/person/inbox' },
+      })[h] || null;
     },
   });
   const n2 = await pub2.publishNote('hi @kofi@b.example and @ghost@z.example');
@@ -524,6 +530,22 @@ check(mfm.source?.content.startsWith('$[tada') && mfm._misskey_content === mfm.s
     'only the resolved mention becomes a tag');
   check(sent[0]?.i.includes('https://b.example/u/kofi/inbox') && sent[0].i.includes('https://f.example/inbox'),
     `the Create goes to followers and to the mentioned actor (${JSON.stringify(sent[0]?.i)})`);
+  const communityPost = await pub2.publishNote('community body', {
+    objectType: 'Article', title: 'Community topic', community: '!tech@lemmy.example',
+  });
+  check(communityPost.audience === 'https://lemmy.example/c/tech'
+    && communityPost.to.includes('https://lemmy.example/c/tech')
+    && sent.at(-1)?.i.includes('https://lemmy.example/c/tech/inbox'),
+  'community publication addresses the Group as audience and delivers to its inbox');
+  const communityCreate = wire.createActivity(communityPost, pub2.urls);
+  check(communityCreate.to.includes(wire.PUBLIC)
+    && communityCreate.cc.includes('https://lemmy.example/c/tech')
+    && communityCreate.audience === 'https://lemmy.example/c/tech',
+  'community Create uses the Lemmy/PieFed public-to, Group-cc audience shape');
+  const notGroup = await pub2.publishNote('body', {
+    objectType: 'Article', title: 'No', community: 'person@b.example',
+  }).then(() => null, error => error.message);
+  check(/not an ActivityPub Group/.test(notGroup), 'community targeting refuses a Person actor');
 
   // Replying without retyping the handles must still reach the group, or a
   // thread breaks the first time somebody trims their reply. A PERSON trimmed

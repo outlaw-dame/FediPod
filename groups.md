@@ -16,6 +16,18 @@ moderation settings decide who reaches you.
 
 As with persons, a group display name and bio should be handled on the client.
 
+## Posting to a Lemmy or PieFed community
+
+FediPod's Mastodon-compatible status endpoint accepts a `community` field with
+the full handle, for example `!technology@lemmy.world`. A top-level community
+post must be public and use an `Article` with a title. FediPod resolves the
+handle, verifies that the actor is a `Group`, addresses the object with the
+Group as its ActivityPub `audience`, and delivers the `Create` to the Group
+inbox. This is different from putting a textual mention in the post body.
+
+Clients can detect this extension through
+`configuration.statuses.community_targeting` in `/api/v2/instance`.
+
 ## Managing a group
 
 The group passes along posts from its own members only. This stops spam from outside the group. Internal moderation is also possible :
