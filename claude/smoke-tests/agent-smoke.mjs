@@ -3880,6 +3880,42 @@ const rels = await call(`/api/v1/accounts/relationships?id[]=${relIds[0]}&id[]=$
 check(rels.status === 200 && rels.json[0].following === true && rels.json[1].followed_by === true,
   'relationships from contacts (following + followed_by)');
 
+const aliceId = store2.idFor(ALICE);
+const blockedAlice = await call(`/api/v1/accounts/${aliceId}/block`, { method: 'POST' });
+const blockList = await call('/api/v1/blocks');
+check(blockedAlice.json.blocking === true && blockList.json.some(a => a.uri === ALICE),
+  'block action is reflected in the Mastodon block list');
+await call(`/api/v1/accounts/${aliceId}/unblock`, { method: 'POST' });
+const muteAlice = await call(`/api/v1/accounts/${aliceId}/mute`, { method: 'POST' });
+const muteList = await call('/api/v1/mutes');
+const mutedNotifications = await call('/api/v1/notifications');
+check(muteAlice.json.muting === true && muteAlice.json.muting_notifications === true
+  && muteList.json.some(a => a.uri === ALICE) && mutedNotifications.json.length === 0,
+  'mute action is listed and suppresses statuses plus notifications');
+await call(`/api/v1/accounts/${aliceId}/unmute`, { method: 'POST' });
+const selfBlock = await call(`/api/v1/accounts/${store2.idFor(urls2.actor)}/block`, { method: 'POST' });
+check(selfBlock.status === 422, 'self block and mute targets are refused');
+
+const filterCreated = await call('/api/v2/filters', {
+  method: 'POST', body: JSON.stringify({
+    title: 'Replies', context: ['home'], filter_action: 'warn',
+    keywords_attributes: [{ keyword: 'a reply', whole_word: true }],
+  }),
+});
+const filteredHome = await call('/api/v1/timelines/home');
+const filteredReply = filteredHome.json.find(s => s.uri === REPLY);
+check(filterCreated.status === 200 && filteredReply.filtered[0]?.filter?.title === 'Replies'
+  && filteredReply.filtered[0]?.keyword_matches.length === 1,
+  'keyword filters produce Mastodon v2 filtered metadata on matching statuses');
+const invalidFilter = await call('/api/v2/filters', {
+  method: 'POST', body: JSON.stringify({
+    title: 'Bad', context: ['somewhere'], filter_action: 'drop',
+    keywords_attributes: [{ keyword: 'x' }],
+  }),
+});
+check(invalidFilter.status === 422, 'invalid filter contexts and actions fail closed');
+await call(`/api/v2/filters/${filterCreated.json.id}`, { method: 'DELETE' });
+
 const ctx = await call(`/api/v1/statuses/${store2.idFor(REPLY)}/context`);
 check(ctx.status === 200 && ctx.json.ancestors.length === 1 && ctx.json.ancestors[0].uri === OWN
   && ctx.json.descendants.length === 1 && ctx.json.descendants[0].uri === OWN2,
