@@ -4040,6 +4040,58 @@ check(deletedCollection.status === 200 && store2.getCollections().length === 0,
   'deleting a Collection removes its published document before local state');
 
 {
+  const sources = await import(path.join(root, 'lib/collection-sources.mjs'));
+  const wpAccounts = sources.parseWordPressCsv(
+    'account,name,link\r\n"@ada@example.social","Ada, A.",https://example.social/@ada\r\n',
+  );
+  const migration = sources.parseMigrationCsv('Science,@ada@example.social\nScience,@bob@example.net\n');
+  const fedi = sources.parseFediDevsCollection(JSON.stringify({
+    id: 'http://fedidevs.com/s/abc/', type: 'Collection', name: 'Developers', summary: 'People who build',
+    items: ['https://example.social/users/ada', 'file:///etc/passwd'],
+  }), 'https://fedidevs.com/s/abc/');
+  check(wpAccounts[0]?.handle === '@ada@example.social' && wpAccounts[0]?.url === 'https://example.social/@ada'
+    && migration.name === 'Science' && migration.accounts.length === 2
+    && fedi.name === 'Developers' && fedi.accounts.length === 1,
+  'the three configured Collection formats parse quoted CSV, follow-pack CSV, and native AP safely');
+  let arbitraryRefused = false;
+  try { sources.classifyCollectionSource('https://attacker.example/people.csv'); } catch { arbitraryRefused = true; }
+  check(arbitraryRefused, 'Collection import cannot be turned into an arbitrary authenticated URL fetcher');
+
+  let sourceAccounts = [
+    { url: 'https://one.example/users/ada', handle: null },
+    { url: 'https://two.example/users/bob', handle: null },
+  ];
+  masto2.collectionSourceLoader = async (url) => ({
+    kind: 'fedidevs', url: String(url), page: String(url), name: 'Developers',
+    description: 'Opt-in starter pack',
+    accounts: sourceAccounts,
+  });
+  const sourceCatalog = await call('/api/v1/collection_sources');
+  const preview = await call('/api/v1/collection_sources/preview', {
+    method: 'POST', body: JSON.stringify({ url: 'https://fedidevs.com/s/abc/' }),
+  });
+  const imported = await call('/api/v1/collection_sources/import', {
+    method: 'POST', body: JSON.stringify({ url: 'https://fedidevs.com/s/abc/' }),
+  });
+  const importedAgain = await call('/api/v1/collection_sources/import', {
+    method: 'POST', body: JSON.stringify({ url: 'https://fedidevs.com/s/abc/' }),
+  });
+  check(sourceCatalog.json.length === 3 && preview.json.account_count === 2
+    && imported.json.account_count === 2 && imported.json.invitation_count === 2
+    && imported.json.collections[0]?.source_kind === 'fedidevs'
+    && importedAgain.json.already_imported === true && store2.getCollections().length === 1,
+  'source preview/import preserves provenance, schedules consent, and is idempotent');
+  sourceAccounts = [{ url: 'https://one.example/users/ada', handle: null }];
+  const refreshed = await call('/api/v1/collection_sources/import', {
+    method: 'POST', body: JSON.stringify({ url: 'https://fedidevs.com/s/abc/' }),
+  });
+  check(refreshed.json.removed_count === 1 && refreshed.json.added_count === 0
+    && store2.getCollections()[0].items.length === 1,
+  'refreshing an imported source honors later opt-outs without duplicating the Collection');
+  await call(`/api/v1/collections/${store2.getCollections()[0].id}`, { method: 'DELETE' });
+}
+
+{
   const { Intake } = await import(path.join(root, 'lib/intake.mjs'));
   const featurePuts = [];
   const featureSends = [];
@@ -4570,7 +4622,8 @@ if (up) {
   }
   check(blocked.every(Boolean), `SSRF guard blocks loopback/private/metadata/file (${blocked.filter(Boolean).length}/6)`);
   check(isPrivateAddress('127.0.0.1') && isPrivateAddress('169.254.169.254')
-    && isPrivateAddress('::1') && !isPrivateAddress('93.184.216.34'),
+    && isPrivateAddress('192.0.0.1') && isPrivateAddress('::1')
+    && !isPrivateAddress('192.0.78.13') && !isPrivateAddress('93.184.216.34'),
     'address classifier: private vs public');
 
   // The v4-mapped spelling that actually ARRIVES. The filter matched only the
