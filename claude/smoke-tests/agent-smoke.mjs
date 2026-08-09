@@ -3821,6 +3821,8 @@ store2.write('statuses.json', [
   { noteId: OWN, actor: urls2.actor, content: '<p>root #Fediverse</p>', published: '2026-07-28T01:00:00Z', kind: 'post', slug: 'n1' },
 ]);
 const DAN = 'https://m.example/u/dan';
+store2.cacheActor(ALICE, { preferredUsername: 'alice', name: 'Alice', type: 'Person' });
+store2.cacheActor(DAN, { preferredUsername: 'dan', name: 'Dan', type: 'Person' });
 store2.setContacts({
   // Append order is arrival order: dan followed after alice.
   followers: [{ actor: ALICE, inbox: 'https://m.example/u/alice/inbox', followId: 'f1' },
@@ -3836,12 +3838,24 @@ const puts = [];
 const outbox2 = [];
 let tagFeedTags = ['solid'];
 let featuredTagPublishes = 0;
+let featuredPublishes = 0;
+let collectionPublishes = 0;
+let collectionRequests = 0;
+const fakeRemote = { put: async (u, b, ct) => puts.push({ u, ct, len: b.length }), putJson: async () => {}, delete: async () => true };
 const fakeAgent = {
   store: store2,
   configured: () => true,
   publisher: {
     urls: urls2, ensureMediaContainer: async () => {}, publishCollections: async () => {},
     publishFeaturedTags: async () => { featuredTagPublishes++; },
+    publishFeatured: async () => { featuredPublishes++; },
+    publishCollection: async () => { collectionPublishes++; },
+    requestCollectionFeature: async (_collection, item) => {
+      collectionRequests++;
+      item.requestId = `${urls2.featureRequests}test-${collectionRequests}`;
+      return true;
+    },
+    remote: fakeRemote,
     recordOutbox: async (i) => { outbox2.unshift(i); },
     unrecordOutbox: async (m) => {
       for (let k = outbox2.length - 1; k >= 0; k--) if (m(outbox2[k])) outbox2.splice(k, 1);
@@ -3851,7 +3865,7 @@ const fakeAgent = {
     deliver: async (inbox, a) => delivered.push({ inbox, a }),
     deliverToAll: async (inboxes, a) => delivered.push({ inboxes, a }),
   },
-  remote: { put: async (u, b, ct) => puts.push({ u, ct, len: b.length }), putJson: async () => {}, delete: async () => true },
+  remote: fakeRemote,
   local: { fedi: urls2.fediverse, delete: async () => {} },
   intake: { fetchAP: async (u) => ({ id: u, type: 'Person', inbox: u + '/inbox', preferredUsername: 'who' }) },
   tagfeed: {
@@ -3963,6 +3977,183 @@ const modernUnfeature = await call('/api/v1/tags/fediverse/unfeature', { method:
 check(modernFeature.json.featured === true && modernUnfeature.json.featured === false
   && featuredTagPublishes === 4,
   'Mastodon 4.4 per-tag feature and unfeature APIs update the same durable collection');
+
+const pinnedStatus = await call(`/api/v1/statuses/${store2.idFor(OWN)}/pin`, { method: 'POST' });
+const pinnedProfile = await call(`/api/v1/accounts/${store2.idFor(urls2.actor)}/statuses?pinned=true`);
+const unpinnedStatus = await call(`/api/v1/statuses/${store2.idFor(OWN)}/unpin`, { method: 'POST' });
+check(pinnedStatus.json.pinned === true && pinnedProfile.json.length === 1
+  && unpinnedStatus.json.pinned === false && featuredPublishes === 2,
+  'pin and unpin update the status and republish the ActivityPub featured collection');
+
+const suggested = await call('/api/v2/suggestions?limit=1');
+const suggestedId = suggested.json[0]?.account?.id;
+const dismissed = suggestedId && await call(`/api/v1/suggestions/${suggestedId}`, { method: 'DELETE' });
+const suggestedAfter = await call('/api/v2/suggestions');
+check(suggested.status === 200 && suggested.json.length === 1 && suggested.json[0].source === 'global'
+  && dismissed.status === 200 && !suggestedAfter.json.some(x => x.account.id === suggestedId),
+  'account suggestions use the v2 envelope and durable dismissals');
+
+const privateInvitation = await call('/api/v1/collections', {
+  method: 'POST', body: JSON.stringify({ name: 'Private', discoverable: false, account_ids: [aliceId] }),
+});
+check(privateInvitation.status === 422 && store2.getCollections().length === 0,
+  'a private Collection cannot leak affiliations through an invitation its target cannot verify');
+
+const createdCollection = await call('/api/v1/collections', {
+  method: 'POST', body: JSON.stringify({
+    name: 'People to read', description: 'Thoughtful accounts', discoverable: true,
+    account_ids: [aliceId],
+  }),
+});
+const collectionId = createdCollection.json?.collection?.id;
+const fetchedCollection = collectionId && await call(`/api/v1/collections/${collectionId}`);
+const ownCollections = await call(`/api/v1/accounts/${store2.idFor(urls2.actor)}/collections`);
+check(createdCollection.status === 200 && createdCollection.json.collection.items[0].state === 'pending'
+  && fetchedCollection.json.collection.name === 'People to read'
+  && ownCollections.json.collections.some(c => c.id === collectionId) && collectionPublishes === 1
+  && collectionRequests === 1 && store2.getCollections()[0].items[0].requestId,
+  'Mastodon Collections are durable, distinct from Lists, and remote recommendations begin pending consent');
+{
+  const { Intake } = await import(path.join(root, 'lib/intake.mjs'));
+  const storedCollection = store2.getCollections()[0];
+  const storedItem = storedCollection.items[0];
+  const authorizationId = 'https://m.example/feature-authorizations/1';
+  const featureReply = new Intake({
+    config: { kind: 'person' }, urls: urls2, store: store2, remote: {}, local: {},
+    deliverer: {}, publisher: fakeAgent.publisher, log: () => {},
+  });
+  featureReply.fetchAP = async () => ({
+    id: authorizationId, type: 'FeatureAuthorization', attributedTo: ALICE,
+    interactingObject: storedCollection.uri, interactionTarget: ALICE,
+  });
+  const acceptedFeature = await featureReply.handle({
+    id: 'https://m.example/accept-feature/1', type: 'Accept', actor: ALICE,
+    object: storedItem.requestId, result: authorizationId,
+  });
+  check(!acceptedFeature && store2.getCollections()[0].items[0].state === 'accepted'
+    && store2.getCollections()[0].items[0].approvalUri === authorizationId
+    && collectionPublishes === 2,
+  'a FeatureRequest acceptance is origin-checked and republishes the authorized FeaturedItem');
+}
+const deletedCollection = await call(`/api/v1/collections/${collectionId}`, { method: 'DELETE' });
+check(deletedCollection.status === 200 && store2.getCollections().length === 0,
+  'deleting a Collection removes its published document before local state');
+
+{
+  const { Intake } = await import(path.join(root, 'lib/intake.mjs'));
+  const featurePuts = [];
+  const featureSends = [];
+  const collectionUri = 'https://m.example/collections/editors';
+  const featureIntake = new Intake({
+    config: { kind: 'person' }, urls: urls2, store: store2, local: {}, publisher: {}, log: () => {},
+    remote: {
+      putJson: async (id, doc) => featurePuts.push({ id, doc }),
+      setAcl: async () => {},
+    },
+    deliverer: { deliver: async (inbox, activity) => featureSends.push({ inbox, activity }) },
+  });
+  featureIntake.fetchAP = async (id) => id === ALICE
+    ? { id: ALICE, type: 'Person', inbox: `${ALICE}/inbox` }
+    : {
+      id: collectionUri, type: 'FeaturedCollection', attributedTo: ALICE,
+      url: collectionUri, name: 'Editors', summary: 'Recommended editors', discoverable: true,
+    };
+  const featureResult = await featureIntake.handle({
+    id: 'https://m.example/requests/feature-1', type: 'FeatureRequest', actor: ALICE,
+    object: urls2.actor, instrument: collectionUri,
+  });
+  const remoteCollection = store2.getRemoteCollections()[0];
+  const inCollections = await call(`/api/v1/accounts/${store2.idFor(urls2.actor)}/in_collections`);
+  const collectionNotifications = await call('/api/v1/notifications');
+  check(!featureResult && featurePuts[0]?.doc?.type === 'FeatureAuthorization'
+    && featureSends[0]?.activity?.type === 'Accept'
+    && featureSends[0]?.activity?.result === featurePuts[0]?.id
+    && remoteCollection?.local === false
+    && inCollections.json.collections[0]?.id === remoteCollection.id
+    && collectionNotifications.json.some(n => n.type === 'added_to_collection'
+      && n.collection?.id === remoteCollection.id),
+  'an inbound FeatureRequest is verified, authorized, listed, and exposed as a Collection notification');
+
+  const revoked = await call(`/api/v1/collections/${remoteCollection.id}/items/${remoteCollection.items[0].id}/revoke`, {
+    method: 'POST',
+  });
+  check(revoked.status === 200 && store2.getRemoteCollections().length === 0
+    && delivered.some(d => d.a?.type === 'Delete' && d.a.object === featurePuts[0]?.id),
+  'the featured account can revoke its authorization and the owner receives a Delete');
+}
+
+store2.updateStatus(OWN2, { quoteOf: OWN, quoteState: 'accepted', quotePolicy: 'followers' });
+const quoteStatus = await call(`/api/v1/statuses/${store2.idFor(OWN2)}`);
+const quotes = await call(`/api/v1/statuses/${store2.idFor(OWN)}/quotes`);
+check(quoteStatus.json.quote.state === 'accepted' && quoteStatus.json.quote.quoted_status.uri === OWN
+  && quotes.json.length === 1 && quotes.json[0].uri === OWN2,
+  'quote entities and the status quotes endpoint expose accepted quote posts');
+const quoteWire = wire.noteDoc({
+  urls: urls2, slug: 'quote', content: 'context', published: '2026-08-09T00:00:00Z',
+  quote: OWN, quotePolicy: 'followers',
+});
+check(quoteWire.quote === OWN
+  && quoteWire.interactionPolicy.canQuote.automaticApproval[0] === urls2.followers
+  && Array.isArray(quoteWire['@context']),
+  'quote posts publish FEP-044f quote and Mastodon interaction-policy fields');
+
+{
+  const { Intake } = await import(path.join(root, 'lib/intake.mjs'));
+  const quoteStore = new PodStore({ log: () => {} });
+  const remoteTarget = 'https://m.example/n/quoted';
+  const localQuote = urls2.notes + 'local-quote';
+  const requestId = localQuote + '-quote-request';
+  quoteStore.write('statuses.json', [
+    { noteId: remoteTarget, actor: ALICE, content: '<p>target</p>', kind: 'timeline' },
+    { noteId: localQuote, actor: urls2.actor, content: '<p>quote</p>', text: 'quote', kind: 'post',
+      quoteOf: remoteTarget, quoteState: 'pending', quoteRequestId: requestId },
+  ]);
+  let rewritten = 0;
+  const intake = new Intake({
+    config: { kind: 'person' }, urls: urls2, remote: {}, local: {}, store: quoteStore,
+    deliverer: {}, publisher: { updateNote: async () => { rewritten++; } }, log: () => {},
+  });
+  intake.fetchAP = async () => ({
+    id: 'https://m.example/auth/1', type: 'QuoteAuthorization', attributedTo: ALICE,
+    interactingObject: localQuote, interactionTarget: remoteTarget,
+  });
+  const acceptedQuote = await intake.handle({
+    id: 'https://m.example/accept/1', type: 'Accept', actor: ALICE,
+    object: requestId, result: 'https://m.example/auth/1',
+  });
+  check(!acceptedQuote && quoteStore.getStatuses().find(s => s.noteId === localQuote)?.quoteState === 'accepted'
+    && quoteStore.getStatuses().find(s => s.noteId === localQuote)?.quoteAuthorization === 'https://m.example/auth/1'
+    && rewritten === 1,
+    'an accepted QuoteRequest is verified against its authorization and republishes the quote');
+
+  const inboundStore = new PodStore({ log: () => {} });
+  inboundStore.write('statuses.json', [{
+    noteId: OWN, actor: urls2.actor, content: '<p>ours</p>', kind: 'post',
+    visibility: 'public', quotePolicy: 'followers',
+  }]);
+  inboundStore.setContacts({ followers: [{ actor: ALICE }], following: [] });
+  const sent = [];
+  const authored = [];
+  const inbound = new Intake({
+    config: { kind: 'person' }, urls: urls2,
+    remote: { putJson: async (id, doc) => authored.push({ id, doc }), setAcl: async () => {} },
+    local: {}, store: inboundStore,
+    deliverer: { deliver: async (inbox, activity) => sent.push({ inbox, activity }) },
+    publisher: {}, log: () => {},
+  });
+  const instrument = 'https://m.example/n/the-quote';
+  inbound.fetchAP = async (id) => id === ALICE
+    ? { id: ALICE, type: 'Person', inbox: ALICE + '/inbox' }
+    : { id: instrument, type: 'Note', attributedTo: ALICE, quote: OWN };
+  const inboundResult = await inbound.handle({
+    id: 'https://m.example/qreq/1', type: 'QuoteRequest', actor: ALICE,
+    object: OWN, instrument,
+  });
+  check(!inboundResult && authored[0]?.doc?.type === 'QuoteAuthorization'
+    && sent[0]?.activity?.type === 'Accept' && sent[0]?.activity?.result === authored[0]?.id
+    && inboundStore.read('quote-authorizations.json', []).length === 1,
+    'an eligible inbound QuoteRequest gets a public authorization and a matching Accept');
+}
 
 const ctx = await call(`/api/v1/statuses/${store2.idFor(REPLY)}/context`);
 check(ctx.status === 200 && ctx.json.ancestors.length === 1 && ctx.json.ancestors[0].uri === OWN
