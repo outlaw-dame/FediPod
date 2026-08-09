@@ -339,6 +339,39 @@ const actor = wire.actorDoc({ urls, handle: 'jeff', name: 'Jeff', publicKeyPem: 
 check(actor.inbox === urls.inbox && actor.publicKey.id === urls.actor + '#main-key', 'actor doc shape');
 const note = wire.noteDoc({ urls, slug: 'x', content: 'a<b>&\n\nc', published: '2026-07-28T00:00:00Z' });
 check(note.content === '<p>a&lt;b&gt;&amp;</p><p>c</p>', `content HTML escaping (got ${note.content})`);
+const article = wire.noteDoc({
+  urls, slug: 'article', content: '# Heading\n\n<script>bad()</script>\n\n**safe**',
+  published: '2026-07-28T00:00:00Z', objectType: 'Article', title: 'Long post',
+  contentType: 'text/markdown',
+});
+check(article.type === 'Article' && article.name === 'Long post'
+  && article.source?.mediaType === 'text/markdown' && article.source.content.startsWith('# Heading'),
+  'Article preserves its title and original Markdown AP source');
+check(article.content.includes('<h1>Heading</h1>') && article.content.includes('<strong>safe</strong>')
+  && !article.content.includes('script') && !article.content.includes('bad()'),
+  'Markdown has a useful, sanitized HTML fallback');
+const mfm = wire.noteDoc({
+  urls, slug: 'mfm', content: '$[tada hello] <img onerror=bad()>', published: '2026-07-28T00:00:00Z',
+  contentType: 'text/x.misskeymarkdown',
+});
+check(mfm.source?.content.startsWith('$[tada') && mfm._misskey_content === mfm.source.content
+  && mfm.content.includes('&lt;img onerror=bad()&gt;'),
+  'MFM preserves original source while its fallback stays escaped');
+
+{
+  const { publicationFields, instanceConfig } = await import(path.join(root, 'lib/mastoapi.mjs'));
+  check(publicationFields({ object_type: 'Article', title: 'A', content_type: 'text/markdown' }).objectType === 'Article',
+    'client API accepts the advertised Article plus Markdown contract');
+  check(!!publicationFields({ object_type: 'Article', content_type: 'text/markdown' }).error
+    && !!publicationFields({ object_type: 'Page', content_type: 'text/plain' }).error
+    && !!publicationFields({ content_type: 'text/html' }).error
+    && !!publicationFields({ status: 'x'.repeat(100_001) }).error,
+  'client API rejects missing Article titles and unsupported object/content types');
+  const caps = instanceConfig().statuses;
+  check(caps.supported_object_types.includes('Article')
+    && caps.supported_content_types.includes('text/x.misskeymarkdown'),
+  'instance capabilities advertise Article, Markdown, and Misskey MFM');
+}
 
 // --- 5b. a handle only resolves from a pod at a host root ---
 {
@@ -1718,7 +1751,9 @@ check(note.content === '<p>a&lt;b&gt;&amp;</p><p>c</p>', `content HTML escaping 
 
 // --- 5a-quater. the fediverse posts more than Notes, and a tag is not a hole ---
 {
-  const { isContentType } = await import(path.join(root, 'lib/intake.mjs'));
+  const { isContentType, sourceOf } = await import(path.join(root, 'lib/intake.mjs'));
+  check(sourceOf({ _misskey_content: '$[tada legacy]' })?.mediaType === 'text/x.misskeymarkdown',
+    'legacy Misskey source metadata is preserved as MFM');
   const { TagFeed } = await import(path.join(root, 'lib/tagfeed.mjs'));
 
   // Insisting on Note dead-lettered an Article, a poll, a PeerTube video and a
