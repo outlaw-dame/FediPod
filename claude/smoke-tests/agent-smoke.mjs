@@ -3899,7 +3899,10 @@ check(selfBlock.status === 422, 'self block and mute targets are refused');
 const filterCreated = await call('/api/v2/filters', {
   method: 'POST', body: JSON.stringify({
     title: 'Replies', context: ['home'], filter_action: 'warn',
-    keywords_attributes: [{ keyword: 'a reply', whole_word: true, semantic: true, semantic_threshold: 0.6 }],
+    keywords_attributes: [{
+      keyword: 'a reply', whole_word: true, semantic: true,
+      semantic_threshold: 0.6, semantic_model: 'embeddinggemma-300m',
+    }],
   }),
 });
 const filteredHome = await call('/api/v1/timelines/home');
@@ -3907,7 +3910,8 @@ const filteredReply = filteredHome.json.find(s => s.uri === REPLY);
 check(filterCreated.status === 200 && filteredReply.filtered[0]?.filter?.title === 'Replies'
   && filteredReply.filtered[0]?.keyword_matches.length === 1
   && filterCreated.json.keywords[0].semantic === true
-  && filterCreated.json.keywords[0].semantic_threshold === 0.6,
+  && filterCreated.json.keywords[0].semantic_threshold === 0.6
+  && filterCreated.json.keywords[0].semantic_model === 'embeddinggemma-300m',
   'filters preserve semantic extensions and produce Mastodon v2 metadata for exact matches');
 const invalidFilter = await call('/api/v2/filters', {
   method: 'POST', body: JSON.stringify({
