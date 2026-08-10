@@ -339,6 +339,42 @@ const actor = wire.actorDoc({ urls, handle: 'jeff', name: 'Jeff', publicKeyPem: 
 check(actor.inbox === urls.inbox && actor.publicKey.id === urls.actor + '#main-key', 'actor doc shape');
 const note = wire.noteDoc({ urls, slug: 'x', content: 'a<b>&\n\nc', published: '2026-07-28T00:00:00Z' });
 check(note.content === '<p>a&lt;b&gt;&amp;</p><p>c</p>', `content HTML escaping (got ${note.content})`);
+const article = wire.noteDoc({
+  urls, slug: 'article', content: '# Heading\n\n<script>bad()</script>\n\n**safe**',
+  published: '2026-07-28T00:00:00Z', objectType: 'Article', title: 'Long post',
+  contentType: 'text/markdown',
+});
+check(article.type === 'Article' && article.name === 'Long post'
+  && article.source?.mediaType === 'text/markdown' && article.source.content.startsWith('# Heading'),
+  'Article preserves its title and original Markdown AP source');
+check(article.content.includes('<h1>Heading</h1>') && article.content.includes('<strong>safe</strong>')
+  && !article.content.includes('script') && !article.content.includes('bad()'),
+  'Markdown has a useful, sanitized HTML fallback');
+const mfm = wire.noteDoc({
+  urls, slug: 'mfm', content: '$[tada hello] <img onerror=bad()>', published: '2026-07-28T00:00:00Z',
+  contentType: 'text/x.misskeymarkdown',
+});
+check(mfm.source?.content.startsWith('$[tada') && mfm._misskey_content === mfm.source.content
+  && mfm.content.includes('&lt;img onerror=bad()&gt;'),
+  'MFM preserves original source while its fallback stays escaped');
+
+{
+  const { publicationFields, instanceConfig } = await import(path.join(root, 'lib/mastoapi.mjs'));
+  check(publicationFields({ object_type: 'Article', title: 'A', content_type: 'text/markdown' }).objectType === 'Article',
+    'client API accepts the advertised Article plus Markdown contract');
+  check(!!publicationFields({ object_type: 'Article', content_type: 'text/markdown' }).error
+    && !!publicationFields({ object_type: 'Page', content_type: 'text/plain' }).error
+    && !!publicationFields({ content_type: 'text/html' }).error
+    && !!publicationFields({ status: 'x'.repeat(100_001) }).error,
+  'client API rejects missing Article titles and unsupported object/content types');
+  check(publicationFields({
+    status: 'body', object_type: 'Article', title: 'Topic', community: '!Tech@LEMMY.WORLD',
+  }).community === 'Tech@lemmy.world', 'client API validates and normalizes a community target');
+  const caps = instanceConfig().statuses;
+  check(caps.supported_object_types.includes('Article')
+    && caps.supported_content_types.includes('text/x.misskeymarkdown') && caps.community_targeting,
+  'instance capabilities advertise Article, Markdown, Misskey MFM, and community targeting');
+}
 
 // --- 5b. a handle only resolves from a pod at a host root ---
 {
@@ -405,7 +441,7 @@ check(note.content === '<p>a&lt;b&gt;&amp;</p><p>c</p>', `content HTML escaping 
 
   const all = mk();
   await all.pub.publishCollections();
-  check(all.seen.length === 10,
+  check(all.seen.length === 12 && all.seen.some(x => x.includes('ap/featured-tags')),
     `an unnarrowed publish is still the whole surface — the outbox is a page + a head now (saw ${all.seen.length})`);
 
   // One new follower changes the follower list. It does not change what this
@@ -480,8 +516,11 @@ check(note.content === '<p>a&lt;b&gt;&amp;</p><p>c</p>', `content HTML escaping 
     publicKeyPem: 'x', log: () => {},
     resolveMention: async (h) => {
       asked.push(h);
-      return h === 'kofi@b.example'
-        ? { id: 'https://b.example/u/kofi', inbox: 'https://b.example/u/kofi/inbox' } : null;
+      return ({
+        'kofi@b.example': { id: 'https://b.example/u/kofi', type: 'Person', inbox: 'https://b.example/u/kofi/inbox' },
+        'tech@lemmy.example': { id: 'https://lemmy.example/c/tech', type: 'Group', inbox: 'https://lemmy.example/c/tech/inbox' },
+        'person@b.example': { id: 'https://b.example/u/person', type: 'Person', inbox: 'https://b.example/u/person/inbox' },
+      })[h] || null;
     },
   });
   const n2 = await pub2.publishNote('hi @kofi@b.example and @ghost@z.example');
@@ -491,6 +530,22 @@ check(note.content === '<p>a&lt;b&gt;&amp;</p><p>c</p>', `content HTML escaping 
     'only the resolved mention becomes a tag');
   check(sent[0]?.i.includes('https://b.example/u/kofi/inbox') && sent[0].i.includes('https://f.example/inbox'),
     `the Create goes to followers and to the mentioned actor (${JSON.stringify(sent[0]?.i)})`);
+  const communityPost = await pub2.publishNote('community body', {
+    objectType: 'Article', title: 'Community topic', community: '!tech@lemmy.example',
+  });
+  check(communityPost.audience === 'https://lemmy.example/c/tech'
+    && communityPost.to.includes('https://lemmy.example/c/tech')
+    && sent.at(-1)?.i.includes('https://lemmy.example/c/tech/inbox'),
+  'community publication addresses the Group as audience and delivers to its inbox');
+  const communityCreate = wire.createActivity(communityPost, pub2.urls);
+  check(communityCreate.to.includes(wire.PUBLIC)
+    && communityCreate.cc.includes('https://lemmy.example/c/tech')
+    && communityCreate.audience === 'https://lemmy.example/c/tech',
+  'community Create uses the Lemmy/PieFed public-to, Group-cc audience shape');
+  const notGroup = await pub2.publishNote('body', {
+    objectType: 'Article', title: 'No', community: 'person@b.example',
+  }).then(() => null, error => error.message);
+  check(/not an ActivityPub Group/.test(notGroup), 'community targeting refuses a Person actor');
 
   // Replying without retyping the handles must still reach the group, or a
   // thread breaks the first time somebody trims their reply. A PERSON trimmed
@@ -820,7 +875,8 @@ check(note.content === '<p>a&lt;b&gt;&amp;</p><p>c</p>', `content HTML escaping 
   check(sentAccept === '*/*', 'the public probe asks for */*, not turtle');
 
   const blind = await mkPub(401).verifyPublicSurface();
-  check(blind.length === 7 && blind.includes('actor') && blind.includes('webfinger'),
+  check(blind.length === 8 && blind.includes('actor') && blind.includes('webfinger')
+    && blind.includes('featured-tags'),
     'verifyPublicSurface names every document the fediverse cannot read');
 
   const open = await mkPub(200).verifyPublicSurface();
@@ -1718,7 +1774,9 @@ check(note.content === '<p>a&lt;b&gt;&amp;</p><p>c</p>', `content HTML escaping 
 
 // --- 5a-quater. the fediverse posts more than Notes, and a tag is not a hole ---
 {
-  const { isContentType } = await import(path.join(root, 'lib/intake.mjs'));
+  const { isContentType, sourceOf } = await import(path.join(root, 'lib/intake.mjs'));
+  check(sourceOf({ _misskey_content: '$[tada legacy]' })?.mediaType === 'text/x.misskeymarkdown',
+    'legacy Misskey source metadata is preserved as MFM');
   const { TagFeed } = await import(path.join(root, 'lib/tagfeed.mjs'));
 
   // Insisting on Note dead-lettered an Article, a poll, a PeerTube video and a
@@ -3760,9 +3818,11 @@ const ALICE = 'https://m.example/u/alice';
 store2.write('statuses.json', [
   { noteId: OWN2, actor: urls2.actor, content: '<p>own reply</p>', published: '2026-07-28T03:00:00Z', inReplyTo: REPLY, kind: 'post', slug: 'n2' },
   { noteId: REPLY, actor: ALICE, content: '<p>a reply</p>', published: '2026-07-28T02:00:00Z', inReplyTo: OWN, kind: 'timeline' },
-  { noteId: OWN, actor: urls2.actor, content: '<p>root</p>', published: '2026-07-28T01:00:00Z', kind: 'post', slug: 'n1' },
+  { noteId: OWN, actor: urls2.actor, content: '<p>root #Fediverse</p>', published: '2026-07-28T01:00:00Z', kind: 'post', slug: 'n1' },
 ]);
 const DAN = 'https://m.example/u/dan';
+store2.cacheActor(ALICE, { preferredUsername: 'alice', name: 'Alice', type: 'Person' });
+store2.cacheActor(DAN, { preferredUsername: 'dan', name: 'Dan', type: 'Person' });
 store2.setContacts({
   // Append order is arrival order: dan followed after alice.
   followers: [{ actor: ALICE, inbox: 'https://m.example/u/alice/inbox', followId: 'f1' },
@@ -3776,11 +3836,26 @@ store2.addNotification({ type: 'favourite', actor: ALICE, noteId: OWN });
 const delivered = [];
 const puts = [];
 const outbox2 = [];
+let tagFeedTags = ['solid'];
+let featuredTagPublishes = 0;
+let featuredPublishes = 0;
+let collectionPublishes = 0;
+let collectionRequests = 0;
+const fakeRemote = { put: async (u, b, ct) => puts.push({ u, ct, len: b.length }), putJson: async () => {}, delete: async () => true };
 const fakeAgent = {
   store: store2,
   configured: () => true,
   publisher: {
     urls: urls2, ensureMediaContainer: async () => {}, publishCollections: async () => {},
+    publishFeaturedTags: async () => { featuredTagPublishes++; },
+    publishFeatured: async () => { featuredPublishes++; },
+    publishCollection: async () => { collectionPublishes++; },
+    requestCollectionFeature: async (_collection, item) => {
+      collectionRequests++;
+      item.requestId = `${urls2.featureRequests}test-${collectionRequests}`;
+      return true;
+    },
+    remote: fakeRemote,
     recordOutbox: async (i) => { outbox2.unshift(i); },
     unrecordOutbox: async (m) => {
       for (let k = outbox2.length - 1; k >= 0; k--) if (m(outbox2[k])) outbox2.splice(k, 1);
@@ -3790,9 +3865,13 @@ const fakeAgent = {
     deliver: async (inbox, a) => delivered.push({ inbox, a }),
     deliverToAll: async (inboxes, a) => delivered.push({ inboxes, a }),
   },
-  remote: { put: async (u, b, ct) => puts.push({ u, ct, len: b.length }), putJson: async () => {}, delete: async () => true },
+  remote: fakeRemote,
   local: { fedi: urls2.fediverse, delete: async () => {} },
   intake: { fetchAP: async (u) => ({ id: u, type: 'Person', inbox: u + '/inbox', preferredUsername: 'who' }) },
+  tagfeed: {
+    config: () => ({ instance: 'https://tags.example', tags: tagFeedTags, intervalMin: 60 }),
+    setConfig: ({ tags }) => { tagFeedTags = tags; },
+  },
 };
 const masto2 = new MastoApi({ agent: fakeAgent, log: () => {} });
 const bearer = masto2.mintToken();
@@ -3822,6 +3901,311 @@ const relIds = [store2.idFor('https://m.example/u/bob'), store2.idFor(ALICE)];
 const rels = await call(`/api/v1/accounts/relationships?id[]=${relIds[0]}&id[]=${relIds[1]}`);
 check(rels.status === 200 && rels.json[0].following === true && rels.json[1].followed_by === true,
   'relationships from contacts (following + followed_by)');
+
+const aliceId = store2.idFor(ALICE);
+const blockedAlice = await call(`/api/v1/accounts/${aliceId}/block`, { method: 'POST' });
+const blockList = await call('/api/v1/blocks');
+check(blockedAlice.json.blocking === true && blockList.json.some(a => a.uri === ALICE),
+  'block action is reflected in the Mastodon block list');
+await call(`/api/v1/accounts/${aliceId}/unblock`, { method: 'POST' });
+const muteAlice = await call(`/api/v1/accounts/${aliceId}/mute`, { method: 'POST' });
+const muteList = await call('/api/v1/mutes');
+const mutedNotifications = await call('/api/v1/notifications');
+check(muteAlice.json.muting === true && muteAlice.json.muting_notifications === true
+  && muteList.json.some(a => a.uri === ALICE) && mutedNotifications.json.length === 0,
+  'mute action is listed and suppresses statuses plus notifications');
+await call(`/api/v1/accounts/${aliceId}/unmute`, { method: 'POST' });
+const selfBlock = await call(`/api/v1/accounts/${store2.idFor(urls2.actor)}/block`, { method: 'POST' });
+check(selfBlock.status === 422, 'self block and mute targets are refused');
+
+const filterCreated = await call('/api/v2/filters', {
+  method: 'POST', body: JSON.stringify({
+    title: 'Replies', context: ['home'], filter_action: 'warn',
+    keywords_attributes: [{
+      keyword: 'a reply', whole_word: true, semantic: true,
+      semantic_threshold: 0.6, semantic_model: 'embeddinggemma-300m',
+    }],
+  }),
+});
+const filteredHome = await call('/api/v1/timelines/home');
+const filteredReply = filteredHome.json.find(s => s.uri === REPLY);
+check(filterCreated.status === 200 && filteredReply.filtered[0]?.filter?.title === 'Replies'
+  && filteredReply.filtered[0]?.keyword_matches.length === 1
+  && filterCreated.json.keywords[0].semantic === true
+  && filterCreated.json.keywords[0].semantic_threshold === 0.6
+  && filterCreated.json.keywords[0].semantic_model === 'embeddinggemma-300m',
+  'filters preserve semantic extensions and produce Mastodon v2 metadata for exact matches');
+const invalidFilter = await call('/api/v2/filters', {
+  method: 'POST', body: JSON.stringify({
+    title: 'Bad', context: ['somewhere'], filter_action: 'drop',
+    keywords_attributes: [{ keyword: 'x' }],
+  }),
+});
+check(invalidFilter.status === 422, 'invalid filter contexts and actions fail closed');
+await call(`/api/v2/filters/${filterCreated.json.id}`, { method: 'DELETE' });
+
+const followedBefore = await call('/api/v1/followed_tags');
+const followed = await call('/api/v1/tags/Fediverse/follow', { method: 'POST' });
+const followedAfter = await call('/api/v1/followed_tags');
+check(followedBefore.json.some(t => t.name === 'solid') && followed.json.following === true
+  && followedAfter.json.some(t => t.name === 'fediverse') && tagFeedTags.includes('fediverse'),
+  'followed-tag APIs update the polling configuration and return Mastodon Tag entities');
+const unfollowedTag = await call('/api/v1/tags/fediverse/unfollow', { method: 'POST' });
+check(unfollowedTag.json.following === false && !tagFeedTags.includes('fediverse'),
+  'unfollowing a hashtag is idempotent and stops future tag-feed polling');
+const invalidTag = await call('/api/v1/tags/1234/follow', { method: 'POST' });
+check(invalidTag.status === 404, 'numeric-only and otherwise invalid hashtags fail closed');
+
+const suggestions = await call('/api/v1/featured_tags/suggestions');
+const featuredTag = await call('/api/v1/featured_tags', {
+  method: 'POST', body: JSON.stringify({ name: '#Fediverse' }),
+});
+const featuredList = await call('/api/v1/featured_tags');
+const featuredEntity = await call('/api/v1/tags/fediverse');
+const ownFeatured = await call(`/api/v1/accounts/${store2.idFor(urls2.actor)}/featured_tags`);
+check(suggestions.json.some(t => t.name === 'fediverse')
+  && featuredTag.json.name === 'fediverse' && featuredTag.json.statuses_count === '1'
+  && featuredList.json.length === 1 && featuredEntity.json.featured === true
+  && ownFeatured.json[0].id === featuredTag.json.id && featuredTagPublishes === 1,
+  'featured-tag APIs expose suggestions, usage metadata, account tags, and publish AP state');
+const unfeatured = await call(`/api/v1/featured_tags/${featuredTag.json.id}`, { method: 'DELETE' });
+check(unfeatured.status === 200 && (await call('/api/v1/featured_tags')).json.length === 0
+  && featuredTagPublishes === 2,
+  'deleting a featured tag republishes the ActivityPub collection');
+const modernFeature = await call('/api/v1/tags/fediverse/feature', { method: 'POST' });
+const modernUnfeature = await call('/api/v1/tags/fediverse/unfeature', { method: 'POST' });
+check(modernFeature.json.featured === true && modernUnfeature.json.featured === false
+  && featuredTagPublishes === 4,
+  'Mastodon 4.4 per-tag feature and unfeature APIs update the same durable collection');
+
+const pinnedStatus = await call(`/api/v1/statuses/${store2.idFor(OWN)}/pin`, { method: 'POST' });
+const pinnedProfile = await call(`/api/v1/accounts/${store2.idFor(urls2.actor)}/statuses?pinned=true`);
+const unpinnedStatus = await call(`/api/v1/statuses/${store2.idFor(OWN)}/unpin`, { method: 'POST' });
+check(pinnedStatus.json.pinned === true && pinnedProfile.json.length === 1
+  && unpinnedStatus.json.pinned === false && featuredPublishes === 2,
+  'pin and unpin update the status and republish the ActivityPub featured collection');
+
+const suggested = await call('/api/v2/suggestions?limit=1');
+const suggestedId = suggested.json[0]?.account?.id;
+const dismissed = suggestedId && await call(`/api/v1/suggestions/${suggestedId}`, { method: 'DELETE' });
+const suggestedAfter = await call('/api/v2/suggestions');
+check(suggested.status === 200 && suggested.json.length === 1 && suggested.json[0].source === 'global'
+  && dismissed.status === 200 && !suggestedAfter.json.some(x => x.account.id === suggestedId),
+  'account suggestions use the v2 envelope and durable dismissals');
+
+const privateInvitation = await call('/api/v1/collections', {
+  method: 'POST', body: JSON.stringify({ name: 'Private', discoverable: false, account_ids: [aliceId] }),
+});
+check(privateInvitation.status === 422 && store2.getCollections().length === 0,
+  'a private Collection cannot leak affiliations through an invitation its target cannot verify');
+
+const createdCollection = await call('/api/v1/collections', {
+  method: 'POST', body: JSON.stringify({
+    name: 'People to read', description: 'Thoughtful accounts', discoverable: true,
+    account_ids: [aliceId],
+  }),
+});
+const collectionId = createdCollection.json?.collection?.id;
+const fetchedCollection = collectionId && await call(`/api/v1/collections/${collectionId}`);
+const ownCollections = await call(`/api/v1/accounts/${store2.idFor(urls2.actor)}/collections`);
+check(createdCollection.status === 200 && createdCollection.json.collection.items[0].state === 'pending'
+  && fetchedCollection.json.collection.name === 'People to read'
+  && ownCollections.json.collections.some(c => c.id === collectionId) && collectionPublishes === 1
+  && collectionRequests === 1 && store2.getCollections()[0].items[0].requestId,
+  'Mastodon Collections are durable, distinct from Lists, and remote recommendations begin pending consent');
+{
+  const { Intake } = await import(path.join(root, 'lib/intake.mjs'));
+  const storedCollection = store2.getCollections()[0];
+  const storedItem = storedCollection.items[0];
+  const authorizationId = 'https://m.example/feature-authorizations/1';
+  const featureReply = new Intake({
+    config: { kind: 'person' }, urls: urls2, store: store2, remote: {}, local: {},
+    deliverer: {}, publisher: fakeAgent.publisher, log: () => {},
+  });
+  featureReply.fetchAP = async () => ({
+    id: authorizationId, type: 'FeatureAuthorization', attributedTo: ALICE,
+    interactingObject: storedCollection.uri, interactionTarget: ALICE,
+  });
+  const acceptedFeature = await featureReply.handle({
+    id: 'https://m.example/accept-feature/1', type: 'Accept', actor: ALICE,
+    object: storedItem.requestId, result: authorizationId,
+  });
+  check(!acceptedFeature && store2.getCollections()[0].items[0].state === 'accepted'
+    && store2.getCollections()[0].items[0].approvalUri === authorizationId
+    && collectionPublishes === 2,
+  'a FeatureRequest acceptance is origin-checked and republishes the authorized FeaturedItem');
+}
+const deletedCollection = await call(`/api/v1/collections/${collectionId}`, { method: 'DELETE' });
+check(deletedCollection.status === 200 && store2.getCollections().length === 0,
+  'deleting a Collection removes its published document before local state');
+
+{
+  const sources = await import(path.join(root, 'lib/collection-sources.mjs'));
+  const wpAccounts = sources.parseWordPressCsv(
+    'account,name,link\r\n"@ada@example.social","Ada, A.",https://example.social/@ada\r\n',
+  );
+  const migration = sources.parseMigrationCsv('Science,@ada@example.social\nScience,@bob@example.net\n');
+  const fedi = sources.parseFediDevsCollection(JSON.stringify({
+    id: 'http://fedidevs.com/s/abc/', type: 'Collection', name: 'Developers', summary: 'People who build',
+    items: ['https://example.social/users/ada', 'file:///etc/passwd'],
+  }), 'https://fedidevs.com/s/abc/');
+  check(wpAccounts[0]?.handle === '@ada@example.social' && wpAccounts[0]?.url === 'https://example.social/@ada'
+    && migration.name === 'Science' && migration.accounts.length === 2
+    && fedi.name === 'Developers' && fedi.accounts.length === 1,
+  'the three configured Collection formats parse quoted CSV, follow-pack CSV, and native AP safely');
+  let arbitraryRefused = false;
+  try { sources.classifyCollectionSource('https://attacker.example/people.csv'); } catch { arbitraryRefused = true; }
+  check(arbitraryRefused, 'Collection import cannot be turned into an arbitrary authenticated URL fetcher');
+
+  let sourceAccounts = [
+    { url: 'https://one.example/users/ada', handle: null },
+    { url: 'https://two.example/users/bob', handle: null },
+  ];
+  masto2.collectionSourceLoader = async (url) => ({
+    kind: 'fedidevs', url: String(url), page: String(url), name: 'Developers',
+    description: 'Opt-in starter pack',
+    accounts: sourceAccounts,
+  });
+  const sourceCatalog = await call('/api/v1/collection_sources');
+  const preview = await call('/api/v1/collection_sources/preview', {
+    method: 'POST', body: JSON.stringify({ url: 'https://fedidevs.com/s/abc/' }),
+  });
+  const imported = await call('/api/v1/collection_sources/import', {
+    method: 'POST', body: JSON.stringify({ url: 'https://fedidevs.com/s/abc/' }),
+  });
+  const importedAgain = await call('/api/v1/collection_sources/import', {
+    method: 'POST', body: JSON.stringify({ url: 'https://fedidevs.com/s/abc/' }),
+  });
+  check(sourceCatalog.json.length === 3 && preview.json.account_count === 2
+    && imported.json.account_count === 2 && imported.json.invitation_count === 2
+    && imported.json.collections[0]?.source_kind === 'fedidevs'
+    && importedAgain.json.already_imported === true && store2.getCollections().length === 1,
+  'source preview/import preserves provenance, schedules consent, and is idempotent');
+  sourceAccounts = [{ url: 'https://one.example/users/ada', handle: null }];
+  const refreshed = await call('/api/v1/collection_sources/import', {
+    method: 'POST', body: JSON.stringify({ url: 'https://fedidevs.com/s/abc/' }),
+  });
+  check(refreshed.json.removed_count === 1 && refreshed.json.added_count === 0
+    && store2.getCollections()[0].items.length === 1,
+  'refreshing an imported source honors later opt-outs without duplicating the Collection');
+  await call(`/api/v1/collections/${store2.getCollections()[0].id}`, { method: 'DELETE' });
+}
+
+{
+  const { Intake } = await import(path.join(root, 'lib/intake.mjs'));
+  const featurePuts = [];
+  const featureSends = [];
+  const collectionUri = 'https://m.example/collections/editors';
+  const featureIntake = new Intake({
+    config: { kind: 'person' }, urls: urls2, store: store2, local: {}, publisher: {}, log: () => {},
+    remote: {
+      putJson: async (id, doc) => featurePuts.push({ id, doc }),
+      setAcl: async () => {},
+    },
+    deliverer: { deliver: async (inbox, activity) => featureSends.push({ inbox, activity }) },
+  });
+  featureIntake.fetchAP = async (id) => id === ALICE
+    ? { id: ALICE, type: 'Person', inbox: `${ALICE}/inbox` }
+    : {
+      id: collectionUri, type: 'FeaturedCollection', attributedTo: ALICE,
+      url: collectionUri, name: 'Editors', summary: 'Recommended editors', discoverable: true,
+    };
+  const featureResult = await featureIntake.handle({
+    id: 'https://m.example/requests/feature-1', type: 'FeatureRequest', actor: ALICE,
+    object: urls2.actor, instrument: collectionUri,
+  });
+  const remoteCollection = store2.getRemoteCollections()[0];
+  const inCollections = await call(`/api/v1/accounts/${store2.idFor(urls2.actor)}/in_collections`);
+  const collectionNotifications = await call('/api/v1/notifications');
+  check(!featureResult && featurePuts[0]?.doc?.type === 'FeatureAuthorization'
+    && featureSends[0]?.activity?.type === 'Accept'
+    && featureSends[0]?.activity?.result === featurePuts[0]?.id
+    && remoteCollection?.local === false
+    && inCollections.json.collections[0]?.id === remoteCollection.id
+    && collectionNotifications.json.some(n => n.type === 'added_to_collection'
+      && n.collection?.id === remoteCollection.id),
+  'an inbound FeatureRequest is verified, authorized, listed, and exposed as a Collection notification');
+
+  const revoked = await call(`/api/v1/collections/${remoteCollection.id}/items/${remoteCollection.items[0].id}/revoke`, {
+    method: 'POST',
+  });
+  check(revoked.status === 200 && store2.getRemoteCollections().length === 0
+    && delivered.some(d => d.a?.type === 'Delete' && d.a.object === featurePuts[0]?.id),
+  'the featured account can revoke its authorization and the owner receives a Delete');
+}
+
+store2.updateStatus(OWN2, { quoteOf: OWN, quoteState: 'accepted', quotePolicy: 'followers' });
+const quoteStatus = await call(`/api/v1/statuses/${store2.idFor(OWN2)}`);
+const quotes = await call(`/api/v1/statuses/${store2.idFor(OWN)}/quotes`);
+check(quoteStatus.json.quote.state === 'accepted' && quoteStatus.json.quote.quoted_status.uri === OWN
+  && quotes.json.length === 1 && quotes.json[0].uri === OWN2,
+  'quote entities and the status quotes endpoint expose accepted quote posts');
+const quoteWire = wire.noteDoc({
+  urls: urls2, slug: 'quote', content: 'context', published: '2026-08-09T00:00:00Z',
+  quote: OWN, quotePolicy: 'followers',
+});
+check(quoteWire.quote === OWN
+  && quoteWire.interactionPolicy.canQuote.automaticApproval[0] === urls2.followers
+  && Array.isArray(quoteWire['@context']),
+  'quote posts publish FEP-044f quote and Mastodon interaction-policy fields');
+
+{
+  const { Intake } = await import(path.join(root, 'lib/intake.mjs'));
+  const quoteStore = new PodStore({ log: () => {} });
+  const remoteTarget = 'https://m.example/n/quoted';
+  const localQuote = urls2.notes + 'local-quote';
+  const requestId = localQuote + '-quote-request';
+  quoteStore.write('statuses.json', [
+    { noteId: remoteTarget, actor: ALICE, content: '<p>target</p>', kind: 'timeline' },
+    { noteId: localQuote, actor: urls2.actor, content: '<p>quote</p>', text: 'quote', kind: 'post',
+      quoteOf: remoteTarget, quoteState: 'pending', quoteRequestId: requestId },
+  ]);
+  let rewritten = 0;
+  const intake = new Intake({
+    config: { kind: 'person' }, urls: urls2, remote: {}, local: {}, store: quoteStore,
+    deliverer: {}, publisher: { updateNote: async () => { rewritten++; } }, log: () => {},
+  });
+  intake.fetchAP = async () => ({
+    id: 'https://m.example/auth/1', type: 'QuoteAuthorization', attributedTo: ALICE,
+    interactingObject: localQuote, interactionTarget: remoteTarget,
+  });
+  const acceptedQuote = await intake.handle({
+    id: 'https://m.example/accept/1', type: 'Accept', actor: ALICE,
+    object: requestId, result: 'https://m.example/auth/1',
+  });
+  check(!acceptedQuote && quoteStore.getStatuses().find(s => s.noteId === localQuote)?.quoteState === 'accepted'
+    && quoteStore.getStatuses().find(s => s.noteId === localQuote)?.quoteAuthorization === 'https://m.example/auth/1'
+    && rewritten === 1,
+    'an accepted QuoteRequest is verified against its authorization and republishes the quote');
+
+  const inboundStore = new PodStore({ log: () => {} });
+  inboundStore.write('statuses.json', [{
+    noteId: OWN, actor: urls2.actor, content: '<p>ours</p>', kind: 'post',
+    visibility: 'public', quotePolicy: 'followers',
+  }]);
+  inboundStore.setContacts({ followers: [{ actor: ALICE }], following: [] });
+  const sent = [];
+  const authored = [];
+  const inbound = new Intake({
+    config: { kind: 'person' }, urls: urls2,
+    remote: { putJson: async (id, doc) => authored.push({ id, doc }), setAcl: async () => {} },
+    local: {}, store: inboundStore,
+    deliverer: { deliver: async (inbox, activity) => sent.push({ inbox, activity }) },
+    publisher: {}, log: () => {},
+  });
+  const instrument = 'https://m.example/n/the-quote';
+  inbound.fetchAP = async (id) => id === ALICE
+    ? { id: ALICE, type: 'Person', inbox: ALICE + '/inbox' }
+    : { id: instrument, type: 'Note', attributedTo: ALICE, quote: OWN };
+  const inboundResult = await inbound.handle({
+    id: 'https://m.example/qreq/1', type: 'QuoteRequest', actor: ALICE,
+    object: OWN, instrument,
+  });
+  check(!inboundResult && authored[0]?.doc?.type === 'QuoteAuthorization'
+    && sent[0]?.activity?.type === 'Accept' && sent[0]?.activity?.result === authored[0]?.id
+    && inboundStore.read('quote-authorizations.json', []).length === 1,
+    'an eligible inbound QuoteRequest gets a public authorization and a matching Accept');
+}
 
 const ctx = await call(`/api/v1/statuses/${store2.idFor(REPLY)}/context`);
 check(ctx.status === 200 && ctx.json.ancestors.length === 1 && ctx.json.ancestors[0].uri === OWN
@@ -3939,7 +4323,7 @@ check(del.status === 200 && delivered.some(d => d.a?.type === 'Delete' && d.a.ob
   check(anyway.status === 200 && !store2.getStatuses().some(s => s.noteId === OWN),
     'an empty replies collection that will not go is not a reason to keep the post');
   fakeAgent.remote.delete = wasDelete;
-  store2.addStatus({ noteId: OWN, actor: urls2.actor, content: '<p>root</p>',
+  store2.addStatus({ noteId: OWN, actor: urls2.actor, content: '<p>root #Fediverse</p>',
     published: '2026-07-28T01:00:00Z', kind: 'post', slug: 'n1' });
 }
 
@@ -4238,7 +4622,8 @@ if (up) {
   }
   check(blocked.every(Boolean), `SSRF guard blocks loopback/private/metadata/file (${blocked.filter(Boolean).length}/6)`);
   check(isPrivateAddress('127.0.0.1') && isPrivateAddress('169.254.169.254')
-    && isPrivateAddress('::1') && !isPrivateAddress('93.184.216.34'),
+    && isPrivateAddress('192.0.0.1') && isPrivateAddress('::1')
+    && !isPrivateAddress('192.0.78.13') && !isPrivateAddress('93.184.216.34'),
     'address classifier: private vs public');
 
   // The v4-mapped spelling that actually ARRIVES. The filter matched only the
@@ -5037,6 +5422,10 @@ const { admitRequest, refuseRequest } = await import(path.join(root, 'lib/social
   check(String(gated.featured || '').endsWith('ap/featured')
     && gated['@context'].some(c => c?.toot && c?.featured),
     'the actor names its featured collection, with the term declared');
+  check(String(gated.featuredTags || '').endsWith('ap/featured-tags')
+    && gated['@context'].some(c => c?.featuredTags)
+    && wire.featuredTagsCollection(gated.featuredTags, ['fediverse'], gated.url).items[0].type === 'Hashtag',
+    'the actor declares and publishes its distinct featured-tags collection');
 }
 {
   const g = groupIntake();
@@ -6199,13 +6588,78 @@ const { admitRequest, refuseRequest } = await import(path.join(root, 'lib/social
     check(vc.source?.note === 'plays records' && vc.source?.fields?.[0]?.value === 'https://example.org',
       'and `source` gives the editor the raw text to reopen with, not rendered HTML');
 
+    const creatorSaved = await fetch(pbase + '/api/v1/accounts/update_credentials', {
+      method: 'PATCH', body: JSON.stringify({
+        attribution_domains: ['https://*.Writers.Example', 'news.writers.example'],
+      }),
+      headers: { 'content-type': 'application/json', authorization: 'Bearer TKN' },
+    });
+    const creatorAccount = await creatorSaved.json();
+    check(creatorSaved.status === 200
+      && JSON.stringify(creatorAccount.source?.attribution_domains)
+        === JSON.stringify(['writers.example', 'news.writers.example'])
+      && republished === 2,
+    'creator domains are normalized, returned in CredentialAccount source, and republish the actor');
+    const invalidCreator = await fetch(pbase + '/api/v1/profile', {
+      method: 'PATCH', body: JSON.stringify({ attribution_domains: ['https://example.org/path'] }),
+      headers: { 'content-type': 'application/json', authorization: 'Bearer TKN' },
+    });
+    check(invalidCreator.status === 422 && pcfg.attributionDomains.length === 2,
+      'the modern profile API rejects paths instead of silently widening creator attribution');
+
     const pdoc = wire2.actorDoc({ urls: purls, handle: 'solo', name: pcfg.name, publicKeyPem: 'P',
-      summary: pcfg.summary, icon: pcfg.icon, image: pcfg.image, fields: pcfg.fields });
+      summary: pcfg.summary, icon: pcfg.icon, image: pcfg.image, fields: pcfg.fields,
+      attributionDomains: pcfg.attributionDomains });
     check(pdoc.image?.type === 'Image' && pdoc.attachment?.[0]?.type === 'PropertyValue'
       && pdoc.attachment[0].value === 'https://example.org'
       && JSON.stringify(pdoc['@context']).includes('PropertyValue'),
       'the actor publishes image and attachment, with PropertyValue declared in the context');
+    const creatorContext = pdoc['@context'].find(value => value?.attributionDomains)?.attributionDomains;
+    check(JSON.stringify(pdoc.attributionDomains) === JSON.stringify(pcfg.attributionDomains)
+      && creatorContext?.['@id'] === 'toot:attributionDomains'
+      && creatorContext?.['@container'] === '@set',
+    'the actor federates attributionDomains using Mastodon’s set-valued JSON-LD term');
     psrv.close();
+  }
+
+  // ---- fediverse:creator link-card attribution ----
+  {
+    const creator = await import(path.join(root, 'lib/creator-attribution.mjs'));
+    check(creator.domainAllowsAttribution(['writers.example'], 'news.writers.example')
+      && !creator.domainAllowsAttribution(['writers.example'], 'other.example'),
+    'creator attribution accepts the configured domain and its subdomains, never a sibling');
+    const page = `<!doctype html><head>
+      <title>Fallback</title><meta property="og:title" content="A careful article">
+      <meta name="description" content="Reported without false credit">
+      <meta name="fediverse:creator" content="@ada@social.example">
+      <meta property="og:site_name" content="Writers">
+    </head>`;
+    const fetcher = async () => new Response(page, {
+      status: 200, headers: { 'content-type': 'text/html; charset=utf-8' },
+    });
+    const status = {
+      noteId: 'https://social.example/posts/1', link: 'https://social.example/@ada/1',
+      content: '<p>Read <a href="https://news.writers.example/story">this</a></p>',
+    };
+    const card = await creator.fetchCreatorPreview(status, {
+      fetcher, resolveCreator: async () => ({
+        actor: 'https://social.example/users/ada', attributionDomains: ['writers.example'], isSelf: false,
+      }),
+    });
+    check(card?.title === 'A careful article' && card.authors[0]?.actor === 'https://social.example/users/ada'
+      && card.missingAttribution === false,
+    'fediverse:creator becomes a verified PreviewCard author only when the actor allows the article domain');
+    const cardApi = masto2.cardJson(card);
+    check(cardApi.authors[0]?.account?.uri === 'https://social.example/users/ada'
+      && cardApi.missing_attribution === false,
+    'the Mastodon PreviewCard API carries its nested author Account for client UIs');
+    const missing = await creator.fetchCreatorPreview(status, {
+      fetcher, resolveCreator: async () => ({
+        actor: 'https://social.example/users/ada', attributionDomains: [], isSelf: true,
+      }),
+    });
+    check(missing?.authors[0]?.actor == null && missing?.missingAttribution === true,
+      'an unapproved self-credit is not trusted and is surfaced as missing attribution');
   }
 
   const bare = await fetch(`http://localhost:${CPORT}/`, { redirect: 'manual' });

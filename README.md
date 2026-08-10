@@ -70,6 +70,40 @@ keyword filters, scheduled posts, pinned posts (visible from other servers),
 blocking and muting from the client, custom emojis, and web-push
 notifications that reach you while the client is closed.
 
+### Ailo AI providers and link safety
+
+People can enter, test, replace, and remove their own provider keys from the
+**FediPod → AI provider keys** panel in Ailo. FediPod stores those keys in
+`provider-secrets.json` inside the active identity directory with owner-only
+permissions (`0600`). Stored values are never returned to Ailo, copied to the
+Solid Pod, or published to the Fediverse; clients receive only configured/source
+state and model names.
+
+For headless installations, environment variables remain supported as a
+fallback. A key saved through Ailo overrides its environment counterpart; when
+that saved key is removed, FediPod falls back to the environment value:
+
+```sh
+AP_OPENAI_API_KEY=...              # or OPENAI_API_KEY
+AP_GEMINI_API_KEY=...              # or GEMINI_API_KEY
+AP_AI_PROVIDER=gemini              # optional default: gemini or openai
+AP_GEMINI_MODEL=gemini-3.6-flash   # optional
+AP_GEMINI_EMBEDDING_MODEL=gemini-embedding-2
+```
+
+Google Safe Browsing link checks use a separate credential:
+
+```sh
+AP_GOOGLE_SAFE_BROWSING_API_KEY=... # or GOOGLE_SAFE_BROWSING_API_KEY
+```
+
+Safe Browsing URL Search sends the complete URL being checked to Google and is
+available for non-commercial use only; commercial applications should use
+Google Web Risk. Google cannot guarantee comprehensive or error-free results:
+some risky sites may not be identified and some safe sites may be identified
+in error. Responses are cached only for Google's stated duration, with unsafe
+classifications refreshed within 30 minutes.
+
 
 ### Other clients
 
