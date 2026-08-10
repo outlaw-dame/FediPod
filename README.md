@@ -70,6 +70,33 @@ keyword filters, scheduled posts, pinned posts (visible from other servers),
 blocking and muting from the client, custom emojis, and web-push
 notifications that reach you while the client is closed.
 
+### Ailo AI providers and link safety
+
+FediPod keeps third-party API keys in its own process; Ailo receives only the
+configured provider names and model names. Configure one or both AI providers
+before starting the agent:
+
+```sh
+AP_OPENAI_API_KEY=...              # or OPENAI_API_KEY
+AP_GEMINI_API_KEY=...              # or GEMINI_API_KEY
+AP_AI_PROVIDER=gemini              # optional default: gemini or openai
+AP_GEMINI_MODEL=gemini-3.6-flash   # optional
+AP_GEMINI_EMBEDDING_MODEL=gemini-embedding-2
+```
+
+Google Safe Browsing link checks use a separate credential:
+
+```sh
+AP_GOOGLE_SAFE_BROWSING_API_KEY=... # or GOOGLE_SAFE_BROWSING_API_KEY
+```
+
+Safe Browsing URL Search sends the complete URL being checked to Google and is
+available for non-commercial use only; commercial applications should use
+Google Web Risk. Google cannot guarantee comprehensive or error-free results:
+some risky sites may not be identified and some safe sites may be identified
+in error. Responses are cached only for Google's stated duration, with unsafe
+classifications refreshed within 30 minutes.
+
 
 ### Other clients
 
