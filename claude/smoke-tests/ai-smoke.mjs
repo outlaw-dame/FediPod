@@ -1,9 +1,48 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { AiService, SafeBrowsingService } from '../../lib/ai.mjs';
+import { ProviderSecretStore } from '../../lib/provider-secrets.mjs';
 
 const jsonResponse = body => new Response(JSON.stringify(body), {
   status: 200, headers: { 'content-type': 'application/json' },
 });
+
+{
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'fedipod-provider-secrets-'));
+  try {
+    const credentials = new ProviderSecretStore({
+      home,
+      env: { AP_OPENAI_API_KEY: 'environment-openai' },
+    });
+    assert.deepEqual(credentials.status(), {
+      openai: { configured: true, source: 'environment' },
+      gemini: { configured: false, source: null },
+      safe_browsing: { configured: false, source: null },
+    });
+    credentials.set('openai', 'local-openai');
+    credentials.set('gemini', 'local-gemini');
+    assert.equal(credentials.key('openai'), 'local-openai', 'local key overrides environment fallback');
+    assert.equal(fs.statSync(path.join(home, 'provider-secrets.json')).mode & 0o777, 0o600);
+    assert.doesNotMatch(JSON.stringify(credentials.status()), /local-openai|local-gemini/,
+      'status never exposes stored secrets');
+
+    const ai = new AiService({ credentials, env: {} });
+    assert.deepEqual(ai.providers(), ['openai', 'gemini']);
+    assert.equal(ai.requireProvider(), 'openai', 'a newly added key becomes the live default without restart');
+    credentials.delete('gemini');
+    assert.deepEqual(ai.providers(), ['openai'], 'credential changes apply without restarting FediPod');
+    credentials.delete('openai');
+    assert.equal(credentials.key('openai'), 'environment-openai', 'removal restores environment fallback');
+
+    fs.unlinkSync(path.join(home, 'provider-secrets.json'));
+    fs.symlinkSync(path.join(home, 'elsewhere.json'), path.join(home, 'provider-secrets.json'));
+    assert.throws(() => credentials.status(), /regular file/, 'symbolic-link stores are rejected');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+}
 
 {
   const calls = [];

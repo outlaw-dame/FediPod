@@ -72,9 +72,16 @@ notifications that reach you while the client is closed.
 
 ### Ailo AI providers and link safety
 
-FediPod keeps third-party API keys in its own process; Ailo receives only the
-configured provider names and model names. Configure one or both AI providers
-before starting the agent:
+People can enter, test, replace, and remove their own provider keys from the
+**FediPod → AI provider keys** panel in Ailo. FediPod stores those keys in
+`provider-secrets.json` inside the active identity directory with owner-only
+permissions (`0600`). Stored values are never returned to Ailo, copied to the
+Solid Pod, or published to the Fediverse; clients receive only configured/source
+state and model names.
+
+For headless installations, environment variables remain supported as a
+fallback. A key saved through Ailo overrides its environment counterpart; when
+that saved key is removed, FediPod falls back to the environment value:
 
 ```sh
 AP_OPENAI_API_KEY=...              # or OPENAI_API_KEY
