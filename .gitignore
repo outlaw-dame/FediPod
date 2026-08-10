@@ -31,6 +31,7 @@ masto-markers.json
 # secrets and local config
 .env
 .env.*
+!.env.example
 .npmrc
 
 # editor / OS droppings

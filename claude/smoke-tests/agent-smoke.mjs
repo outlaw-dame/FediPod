@@ -3847,6 +3847,65 @@ const unboost = await call(`/api/v1/statuses/${store2.idFor(REPLY)}/unreblog`, {
 check(unboost.json.reblogged === false && !outbox2.some(i => i?.type === 'Announce' && i.object === REPLY),
   'unreblog takes it back out again');
 
+// --- Ailo/FediPod extension: /api/v1/ailo/ai/* (see lib/ai.mjs). No
+// AP_OPENAI_API_KEY in this env, so every route past `status` must 503
+// rather than attempt a real network call.
+const aiStatus = await call('/api/v1/ailo/ai/status');
+check(aiStatus.status === 200 && aiStatus.json.enabled === false,
+  'ai status reports disabled with no AP_OPENAI_API_KEY');
+const aiTranslate = await call('/api/v1/ailo/ai/translate',
+  { method: 'POST', body: JSON.stringify({ text: 'hi', target_lang: 'es' }) });
+check(aiTranslate.status === 503, `ai translate refuses when disabled (got ${aiTranslate.status})`);
+const aiHashtags = await call('/api/v1/ailo/ai/hashtags/suggest',
+  { method: 'POST', body: JSON.stringify({ text: 'a post' }) });
+check(aiHashtags.status === 503, `ai hashtag suggest refuses when disabled (got ${aiHashtags.status})`);
+const aiModeration = await call('/api/v1/ailo/ai/moderation/suggest', { method: 'POST' });
+check(aiModeration.status === 503, `ai moderation suggest refuses when disabled (got ${aiModeration.status})`);
+const aiMatch = await call('/api/v1/ailo/ai/filters/match',
+  { method: 'POST', body: JSON.stringify({ queries: [], documents: [] }) });
+check(aiMatch.status === 503, `ai filter match refuses when disabled (got ${aiMatch.status})`);
+
+// A semantic filter keyword round-trips its extension fields (semantic,
+// semantic_threshold, semantic_model) through create → get. These used to be
+// silently dropped by keywordsOf()/filterJson(), so a client that stored
+// "use OpenAI for this one" saw it revert to unset on the very next reload.
+const madeFilter = await call('/api/v2/filters', {
+  method: 'POST',
+  body: JSON.stringify({
+    title: 'ai smoke filter',
+    keywords_attributes: [{
+      keyword: 'spoilerword', whole_word: false,
+      semantic: true, semantic_threshold: 0.7, semantic_model: 'openai-text-embedding-3-small',
+    }],
+  }),
+});
+check(madeFilter.status === 200 && madeFilter.json.keywords[0].semantic === true
+  && madeFilter.json.keywords[0].semantic_threshold === 0.7
+  && madeFilter.json.keywords[0].semantic_model === 'openai-text-embedding-3-small',
+  `filter create round-trips semantic extension fields (got ${JSON.stringify(madeFilter.json?.keywords?.[0])})`);
+const gotFilters = await call('/api/v2/filters');
+check(gotFilters.status === 200 && gotFilters.json.some(f => f.id === madeFilter.json.id
+  && f.keywords[0].semantic_model === 'openai-text-embedding-3-small'),
+  'filter list still carries the semantic fields after a fresh GET');
+
+// lib/ai.mjs's pure validators — no network, no API key needed.
+{
+  const { cleanHashtags, cleanModerationSuggestions } = await import(path.join(root, 'lib/ai.mjs'));
+  const tags = cleanHashtags(['#Solid', 'fediverse', 'fediverse', '', 'no spaces allowed', 'ok_2']);
+  check(JSON.stringify(tags) === JSON.stringify(['solid', 'fediverse', 'ok_2']),
+    `cleanHashtags lowercases, strips "#", dedupes, drops invalid (got ${JSON.stringify(tags)})`);
+
+  const suggestions = cleanModerationSuggestions({
+    keywords: [{ keyword: 'cryptoscam', reason: 'matches existing filter pattern' }, { keyword: '' }],
+    domains: [{ domain: 'spam.example', reason: 'matches a blocked domain pattern' }],
+    accounts: 'not an array',
+  });
+  check(suggestions.keywords.length === 1 && suggestions.keywords[0].keyword === 'cryptoscam'
+    && suggestions.domains.length === 1 && suggestions.domains[0].domain === 'spam.example'
+    && Array.isArray(suggestions.accounts) && suggestions.accounts.length === 0,
+    `cleanModerationSuggestions drops incomplete entries and tolerates a non-array field (got ${JSON.stringify(suggestions)})`);
+}
+
 const fol = await call(`/api/v1/accounts/${store2.idFor('https://m.example/u/carol')}/follow`, { method: 'POST' });
 check(fol.status === 200 && fol.json.requested === true
   && delivered.some(d => d.a?.type === 'Follow' && d.a.object === 'https://m.example/u/carol'),

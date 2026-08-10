@@ -82,11 +82,19 @@ import net from 'node:net';
 import readline from 'node:readline';
 import { spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { config as loadDotenv } from 'dotenv';
 import { apRoot, profilesDir, identityHomes, isLegacyRoot, CURRENT_ROOT, tildify, rootOf,
   readRoot, writeRoot, defaultProfile, profileHome, rootHoldsIdentity, ROOT_FILE,
   recordLastUsed, writeJsonAtomic } from '../lib/home.mjs';
 import { insecureUrlReason } from '../lib/safefetch.mjs';
 import { portFree, freePortFrom } from '../lib/ports.mjs';
+
+// Loaded once, here, before anything else runs: AP_OPENAI_API_KEY (and any
+// other .env-supplied var) needs to be in process.env before `up`/`setup`
+// spawn run-agent.mjs (which inherits via `env: { ...process.env, ... }`) or
+// import it in-process. Missing .env is not an error — every AI route just
+// answers 503 (see lib/ai.mjs's isAiEnabled()).
+loadDotenv({ path: new URL('../.env', import.meta.url), quiet: true });
 
 const args = process.argv.slice(2);
 const cmd = args[0];

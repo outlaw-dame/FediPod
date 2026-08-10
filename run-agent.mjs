@@ -27,6 +27,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { config as loadDotenv } from 'dotenv';
 
 import { PodStore } from './lib/store.mjs';
 import { apRoot, writeJsonAtomic } from './lib/home.mjs';
@@ -38,6 +39,18 @@ import { Deliverer } from './lib/deliver.mjs';
 import { Publisher } from './lib/publisher.mjs';
 import { Intake } from './lib/intake.mjs';
 import { TagFeed } from './lib/tagfeed.mjs';
+
+// `bin/fedipod.mjs up`/`setup` already load .env before spawning or
+// in-process-importing this module, so process.env is normally populated by
+// the time any of the imports above run their own top-level code; this call
+// only matters for `node run-agent.mjs` / `npm run agent` direct invocation
+// (see the header comment above). Static imports are hoisted and evaluated
+// before this line regardless of where it's textually placed, so — same as
+// in bin/fedipod.mjs — nothing here may read AP_OPENAI_API_KEY at module
+// top-level; lib/ai.mjs reads it lazily, inside its functions, for exactly
+// this reason. dotenv does not override already-set vars, so calling it
+// twice (once here, once in bin/fedipod.mjs) is harmless.
+loadDotenv({ path: new URL('.env', import.meta.url), quiet: true });
 import { Atproto } from './lib/atproto.mjs';
 import { BskyFeed } from './lib/bskyfeed.mjs';
 import { BskyGroup } from './lib/bskygroup.mjs';

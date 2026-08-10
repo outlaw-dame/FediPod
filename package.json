@@ -41,7 +41,9 @@
   },
   "dependencies": {
     "@fedify/fedify": "^2.3.4",
+    "dotenv": "^17.4.2",
     "jose": "^6.2.8",
+    "openai": "^7.4.0",
     "rdflib": "^2.4.0",
     "sanitize-html": "^2.17.6",
     "undici": "^6.28.0",
