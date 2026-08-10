@@ -6588,13 +6588,78 @@ const { admitRequest, refuseRequest } = await import(path.join(root, 'lib/social
     check(vc.source?.note === 'plays records' && vc.source?.fields?.[0]?.value === 'https://example.org',
       'and `source` gives the editor the raw text to reopen with, not rendered HTML');
 
+    const creatorSaved = await fetch(pbase + '/api/v1/accounts/update_credentials', {
+      method: 'PATCH', body: JSON.stringify({
+        attribution_domains: ['https://*.Writers.Example', 'news.writers.example'],
+      }),
+      headers: { 'content-type': 'application/json', authorization: 'Bearer TKN' },
+    });
+    const creatorAccount = await creatorSaved.json();
+    check(creatorSaved.status === 200
+      && JSON.stringify(creatorAccount.source?.attribution_domains)
+        === JSON.stringify(['writers.example', 'news.writers.example'])
+      && republished === 2,
+    'creator domains are normalized, returned in CredentialAccount source, and republish the actor');
+    const invalidCreator = await fetch(pbase + '/api/v1/profile', {
+      method: 'PATCH', body: JSON.stringify({ attribution_domains: ['https://example.org/path'] }),
+      headers: { 'content-type': 'application/json', authorization: 'Bearer TKN' },
+    });
+    check(invalidCreator.status === 422 && pcfg.attributionDomains.length === 2,
+      'the modern profile API rejects paths instead of silently widening creator attribution');
+
     const pdoc = wire2.actorDoc({ urls: purls, handle: 'solo', name: pcfg.name, publicKeyPem: 'P',
-      summary: pcfg.summary, icon: pcfg.icon, image: pcfg.image, fields: pcfg.fields });
+      summary: pcfg.summary, icon: pcfg.icon, image: pcfg.image, fields: pcfg.fields,
+      attributionDomains: pcfg.attributionDomains });
     check(pdoc.image?.type === 'Image' && pdoc.attachment?.[0]?.type === 'PropertyValue'
       && pdoc.attachment[0].value === 'https://example.org'
       && JSON.stringify(pdoc['@context']).includes('PropertyValue'),
       'the actor publishes image and attachment, with PropertyValue declared in the context');
+    const creatorContext = pdoc['@context'].find(value => value?.attributionDomains)?.attributionDomains;
+    check(JSON.stringify(pdoc.attributionDomains) === JSON.stringify(pcfg.attributionDomains)
+      && creatorContext?.['@id'] === 'toot:attributionDomains'
+      && creatorContext?.['@container'] === '@set',
+    'the actor federates attributionDomains using Mastodon’s set-valued JSON-LD term');
     psrv.close();
+  }
+
+  // ---- fediverse:creator link-card attribution ----
+  {
+    const creator = await import(path.join(root, 'lib/creator-attribution.mjs'));
+    check(creator.domainAllowsAttribution(['writers.example'], 'news.writers.example')
+      && !creator.domainAllowsAttribution(['writers.example'], 'other.example'),
+    'creator attribution accepts the configured domain and its subdomains, never a sibling');
+    const page = `<!doctype html><head>
+      <title>Fallback</title><meta property="og:title" content="A careful article">
+      <meta name="description" content="Reported without false credit">
+      <meta name="fediverse:creator" content="@ada@social.example">
+      <meta property="og:site_name" content="Writers">
+    </head>`;
+    const fetcher = async () => new Response(page, {
+      status: 200, headers: { 'content-type': 'text/html; charset=utf-8' },
+    });
+    const status = {
+      noteId: 'https://social.example/posts/1', link: 'https://social.example/@ada/1',
+      content: '<p>Read <a href="https://news.writers.example/story">this</a></p>',
+    };
+    const card = await creator.fetchCreatorPreview(status, {
+      fetcher, resolveCreator: async () => ({
+        actor: 'https://social.example/users/ada', attributionDomains: ['writers.example'], isSelf: false,
+      }),
+    });
+    check(card?.title === 'A careful article' && card.authors[0]?.actor === 'https://social.example/users/ada'
+      && card.missingAttribution === false,
+    'fediverse:creator becomes a verified PreviewCard author only when the actor allows the article domain');
+    const cardApi = masto2.cardJson(card);
+    check(cardApi.authors[0]?.account?.uri === 'https://social.example/users/ada'
+      && cardApi.missing_attribution === false,
+    'the Mastodon PreviewCard API carries its nested author Account for client UIs');
+    const missing = await creator.fetchCreatorPreview(status, {
+      fetcher, resolveCreator: async () => ({
+        actor: 'https://social.example/users/ada', attributionDomains: [], isSelf: true,
+      }),
+    });
+    check(missing?.authors[0]?.actor == null && missing?.missingAttribution === true,
+      'an unapproved self-credit is not trusted and is surfaced as missing attribution');
   }
 
   const bare = await fetch(`http://localhost:${CPORT}/`, { redirect: 'manual' });
