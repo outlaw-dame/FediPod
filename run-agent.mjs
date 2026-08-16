@@ -39,6 +39,8 @@ import { Deliverer } from './lib/deliver.mjs';
 import { Publisher } from './lib/publisher.mjs';
 import { Intake } from './lib/intake.mjs';
 import { TagFeed } from './lib/tagfeed.mjs';
+import { CustomFeedSources } from './lib/custom-feed-sources.mjs';
+import { PublicFeed } from './lib/publicfeed.mjs';
 
 // `bin/fedipod.mjs up`/`setup` already load .env before spawning or
 // in-process-importing this module, so process.env is normally populated by
@@ -125,6 +127,10 @@ export class Agent {
       tagfeed: this.tagfeed
         ? { ...this.tagfeed.config(), lastSweep: this.tagfeed.lastSweep, lastAdded: this.tagfeed.lastAdded }
         : null,
+      customFeedSources: this.customFeedSources
+        ? { lastSweep: this.customFeedSources.lastSweep, lastAdded: this.customFeedSources.lastAdded }
+        : null,
+      publicfeed: this.publicfeed?.status() || null,
       atproto: this.atproto?.status() || null,
       // Anyone asking whether this agent is hammering their server can read the
       // answer here instead of in their access log.
@@ -317,6 +323,8 @@ export class Agent {
     this.intake?.stop();
     this.deliverer?.stop();
     this.tagfeed?.stop();
+    this.customFeedSources?.stop();
+    this.publicfeed?.stop();
     clearInterval(this.schedTimer);
     this.deliverer = new Deliverer({
       store: this.store, rsaPrivate: keys.rsaPrivate, keyId: this.urls.actor + '#main-key',
@@ -336,6 +344,11 @@ export class Agent {
       config, urls: this.urls, remote: this.remote, local: this.local, store: this.store,
       deliverer: this.deliverer, publisher: this.publisher, log: this.log, lease: this.lease,
     });
+    // Public discovery is a local, bounded view cache. It is safe in viewer
+    // mode because it performs no ActivityPub delivery or pod publication;
+    // keeping it alive there also means a second device still has a fresh feed.
+    this.publicfeed = new PublicFeed({ store: this.store, log: this.log });
+    if (process.env.AP_PUBLIC_FEED !== '0') this.publicfeed.start();
     // The Bluesky connection, when one exists. Stamped to this actor; a
     // credential connected for another identity is treated as absent.
     this.atproto = new Atproto({ localDir: this.home, actorId: this.urls.actor, log: this.log });
@@ -494,6 +507,8 @@ export class Agent {
     // reach of any later stop().
     this.tagfeed ||= new TagFeed({ store: this.store, intake: this.intake, log: this.log });
     this.tagfeed.start();
+    this.customFeedSources ||= new CustomFeedSources({ store: this.store, intake: this.intake, agent: this, log: this.log });
+    this.customFeedSources.start();
     this.startBsky();
     // Scheduled posts: a 30s sweep publishes what has come due. The entry is
     // removed before publishing, so a slow publish cannot double-post; a
@@ -583,6 +598,7 @@ export class Agent {
     this.log('another device took over — demoting to viewer');
     this.intake?.stop();
     this.tagfeed?.stop();
+    this.customFeedSources?.stop();
     this.bskyfeed?.stop();
     this.deliverer?.stop();
     clearInterval(this.schedTimer);
@@ -613,6 +629,8 @@ export class Agent {
         await this.intake.start();
         this.tagfeed ||= new TagFeed({ store: this.store, intake: this.intake, log: this.log });
         this.tagfeed.start();
+        this.customFeedSources ||= new CustomFeedSources({ store: this.store, intake: this.intake, agent: this, log: this.log });
+        this.customFeedSources.start();
         this.startBsky();
         this.log('takeover complete — draining resumed on this device');
       } catch (e) { this.log(`takeover drain start: ${e.message}`); }

@@ -22,6 +22,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 // Throwaway agents must not claim (or yield) the real machine's directory
 // door on 8030 — every child spawned below inherits this.
 process.env.AP_DIRECTORY = '0';
+process.env.AP_PUBLIC_FEED = '0';
 let bootLog = '';
 const HOME = fs.mkdtempSync('/tmp/fedipod-smoke-');
 const PORT = 18621;
@@ -179,7 +180,13 @@ if (up) {
   // --- 3. facade basics ---
   const inst = await fetch(`http://127.0.0.1:${PORT}/api/v1/instance`, { headers: gh });
   const instBody = await inst.json();
-  check(inst.status === 200 && /fedipod/.test(instBody.version), `/api/v1/instance → 200 (got ${inst.status})`);
+  check(inst.status === 200 && /fedipod/.test(instBody.version)
+    && instBody.configuration?.ailo?.api_version === 1
+    && instBody.configuration?.ailo?.min_ailo_api_version === 1
+    && instBody.configuration?.ailo?.fedipod_version === JSON.parse(fs.readFileSync(path.join(root, 'package.json'))).version
+    && instBody.configuration?.ailo?.features?.includes('tag_timeline')
+    && instBody.configuration?.ailo?.features?.includes('public_feed'),
+    `/api/v1/instance advertises its exact Ailo contract (got ${inst.status})`);
 
   const apps = await fetch(`http://127.0.0.1:${PORT}/api/v1/apps`, {
     method: 'POST', headers: { ...gh, 'content-type': 'application/json' },
@@ -4063,6 +4070,20 @@ const homeWithTag = await call('/api/v1/timelines/home');
 // Boosted content arrives in the boost shape — the carrier on the outside,
 // the post itself in `reblog` — so it is found either place.
 const uriOf = (s) => [s.uri, s.reblog?.uri];
+const solidTag = await call('/api/v1/timelines/tag/solid');
+store2.addStatus({
+  noteId: 'https://m.example/n/t2', actor: ALICE, kind: 'tag',
+  content: '<p>Markup hashtag <a href="https://m.example/tags/LinkedData" rel="tag">#<span>LinkedData</span></a></p>',
+  published: '2025-01-02T00:00:00.000Z',
+});
+const linkedDataTag = await call('/api/v1/timelines/tag/linkeddata');
+const absentTag = await call('/api/v1/timelines/tag/not_here');
+check(solidTag.status === 200 && solidTag.json.length === 1
+  && uriOf(solidTag.json[0]).includes('https://m.example/n/t1')
+  && linkedDataTag.status === 200 && linkedDataTag.json.length === 1
+  && uriOf(linkedDataTag.json[0]).includes('https://m.example/n/t2')
+  && absentTag.status === 200 && absentTag.json.length === 0,
+  'tag timeline matches plain-text and federated HTML hashtags only');
 check(homeWithTag.json.some(s => uriOf(s).includes('https://m.example/n/t1'))
   && homeWithTag.json.some(s => uriOf(s).includes('https://m.example/n/boost1')),
   'home timeline includes tag-feed + boosted content');
